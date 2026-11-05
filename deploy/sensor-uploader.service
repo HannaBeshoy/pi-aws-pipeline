@@ -1,0 +1,27 @@
+# /etc/systemd/system/sensor-uploader.service - runs the uploader on the Pi
+# Credentials: /etc/sensor-uploader/credentials (an AWS credentials file, mode 0600, owner sensor).
+[Unit]
+Description=Upload sensor readings to Amazon S3
+After=network-online.target sensor-logger.service
+Wants=network-online.target
+
+[Service]
+User=sensor
+Environment=AWS_SHARED_CREDENTIALS_FILE=/etc/sensor-uploader/credentials
+Environment=AWS_REGION=us-east-1
+ExecStart=/usr/bin/python3 /opt/pi-aws-pipeline/device/uploader.py --logs /var/lib/sensor-logs \
+  --spool /var/lib/sensor-spool --bucket BUCKET --device pi-01 --interval 300
+# at shutdown, send the unfinished minute too
+ExecStopPost=/usr/bin/python3 /opt/pi-aws-pipeline/device/uploader.py --logs /var/lib/sensor-logs \
+  --spool /var/lib/sensor-spool --bucket BUCKET --device pi-01 --flush
+Restart=on-failure
+RestartSec=30
+StateDirectory=sensor-spool
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadOnlyPaths=/var/lib/sensor-logs
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

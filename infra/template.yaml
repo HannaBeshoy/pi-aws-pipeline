@@ -1,0 +1,301 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Metadata:
+  cfn-lint:
+    config:
+      ignore_checks: [W3002]   # Code: is a local folder, uploaded by "aws cloudformation package" (deploy/deploy.sh)
+Description: >-
+  Pi sensor pipeline (AWS Cloud course project). The Raspberry Pi uploads readings to S3, a
+  Lambda function checks them and writes per-minute summaries to DynamoDB, a second Lambda
+  reads them back, CloudWatch alarms report errors and a silent device.
+
+Parameters:
+  LabRoleArn:
+    Type: String
+    Default: ""
+    Description: >-
+      AWS Academy Learner Lab cannot create IAM roles or users: give the ARN of LabRole there
+      (arn:aws:iam::<account>:role/LabRole). Leave empty in a normal account, and the template
+      creates least-privilege roles and the device user itself.
+  DeviceId:
+    Type: String
+    Default: pi-01
+    AllowedPattern: "[A-Za-z0-9_-]{1,32}"
+  AlarmTempC:
+    Type: Number
+    Default: 40
+  AlarmEmail:
+    Type: String
+    Default: ""
+    Description: optional; an e-mail address for alarms (confirm the subscription e-mail)
+  RetentionDays:
+    Type: Number
+    Default: 90
+    MinValue: 1
+  Architecture:
+    Type: String
+    Default: arm64
+    AllowedValues: [arm64, x86_64]
+
+Conditions:
+  CreateRoles: !Equals [!Ref LabRoleArn, ""]
+  HasEmail: !Not [!Equals [!Ref AlarmEmail, ""]]
+
+Resources:
+  # --- storage ---------------------------------------------------------------------------
+  DataBucket:
+    Type: AWS::S3::Bucket
+    DependsOn: IngestPermission
+    Properties:
+      BucketName: !Sub "${AWS::StackName}-${AWS::AccountId}-data"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules: [{ObjectOwnership: BucketOwnerEnforced}]
+      LifecycleConfiguration:
+        Rules:
+          - Id: raw-to-glacier-ir-then-expire
+            Status: Enabled
+            Prefix: raw/
+            Transitions: [{StorageClass: GLACIER_IR, TransitionInDays: 30}]
+            ExpirationInDays: 365
+          - Id: quarantine-expire
+            Status: Enabled
+            Prefix: quarantine/
+            ExpirationInDays: 90
+          - Id: abort-incomplete-uploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload: {DaysAfterInitiation: 7}
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: "s3:ObjectCreated:*"
+            Filter: {S3Key: {Rules: [{Name: prefix, Value: raw/}, {Name: suffix, Value: .jsonl.gz}]}}
+            Function: !GetAtt IngestFunction.Arn
+
+  DataBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref DataBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyPlainHttp
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource: [!GetAtt DataBucket.Arn, !Sub "${DataBucket.Arn}/*"]
+            Condition: {Bool: {"aws:SecureTransport": "false"}}
+
+  ReadingsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${AWS::StackName}-readings"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - {AttributeName: device, AttributeType: S}
+        - {AttributeName: sk, AttributeType: S}
+      KeySchema:
+        - {AttributeName: device, KeyType: HASH}
+        - {AttributeName: sk, KeyType: RANGE}
+      TimeToLiveSpecification: {AttributeName: expires, Enabled: true}
+      SSESpecification: {SSEEnabled: true}
+
+  AlarmTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${AWS::StackName}-alarms"
+
+  AlarmEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasEmail
+    Properties:
+      TopicArn: !Ref AlarmTopic
+      Protocol: email
+      Endpoint: !Ref AlarmEmail
+
+  # --- compute ---------------------------------------------------------------------------
+  IngestLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-ingest"
+      RetentionInDays: 14
+
+  ApiLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-api"
+      RetentionInDays: 14
+
+  IngestFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: IngestLogGroup
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-ingest"
+      Runtime: python3.12
+      Architectures: [!Ref Architecture]
+      Handler: handler.handler
+      Code: ../lambda/ingest/
+      MemorySize: 256
+      Timeout: 60
+      Role: !If [CreateRoles, !GetAtt IngestRole.Arn, !Ref LabRoleArn]
+      Environment:
+        Variables:
+          TABLE: !Ref ReadingsTable
+          ALARM_TEMP_C: !Ref AlarmTempC
+          ALARM_TOPIC_ARN: !Ref AlarmTopic
+          RETENTION_DAYS: !Ref RetentionDays
+
+  IngestPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref IngestFunction
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+      SourceArn: !Sub "arn:${AWS::Partition}:s3:::${AWS::StackName}-${AWS::AccountId}-data"
+
+  ApiFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: ApiLogGroup
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-api"
+      Runtime: python3.12
+      Architectures: [!Ref Architecture]
+      Handler: handler.handler
+      Code: ../lambda/api/
+      MemorySize: 128
+      Timeout: 10
+      Role: !If [CreateRoles, !GetAtt ApiRole.Arn, !Ref LabRoleArn]
+      Environment:
+        Variables:
+          TABLE: !Ref ReadingsTable
+
+  ApiUrl:
+    Type: AWS::Lambda::Url
+    Properties:
+      TargetFunctionArn: !GetAtt ApiFunction.Arn
+      AuthType: AWS_IAM
+
+  # --- monitoring ------------------------------------------------------------------------
+  IngestErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-ingest-errors"
+      AlarmDescription: the ingest function failed (a file was not processed)
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions: [{Name: FunctionName, Value: !Ref IngestFunction}]
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  DeviceSilentAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-device-silent"
+      AlarmDescription: no readings arrived for 15 minutes (Pi off, network down or uploader stopped)
+      Namespace: SensorPipeline
+      MetricName: Readings
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: breaching
+      AlarmActions: [!Ref AlarmTopic]
+      OKActions: [!Ref AlarmTopic]
+
+  # --- least-privilege IAM (not in AWS Academy) -------------------------------------------
+  IngestRole:
+    Type: AWS::IAM::Role
+    Condition: CreateRoles
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - {Effect: Allow, Principal: {Service: lambda.amazonaws.com}, Action: "sts:AssumeRole"}
+      Policies:
+        - PolicyName: ingest
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ReadRaw
+                Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub "arn:${AWS::Partition}:s3:::${AWS::StackName}-${AWS::AccountId}-data/raw/*"
+              - Sid: WriteQuarantine
+                Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub "arn:${AWS::Partition}:s3:::${AWS::StackName}-${AWS::AccountId}-data/quarantine/*"
+              - Sid: Summaries
+                Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:PutItem]
+                Resource: !GetAtt ReadingsTable.Arn
+              - Sid: Alarm
+                Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref AlarmTopic
+              - Sid: Logs
+                Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub "${IngestLogGroup.Arn}"
+
+  ApiRole:
+    Type: AWS::IAM::Role
+    Condition: CreateRoles
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - {Effect: Allow, Principal: {Service: lambda.amazonaws.com}, Action: "sts:AssumeRole"}
+      Policies:
+        - PolicyName: api
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ReadSummaries
+                Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:Query]
+                Resource: !GetAtt ReadingsTable.Arn
+              - Sid: Logs
+                Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub "${ApiLogGroup.Arn}"
+
+  DeviceUser:
+    Type: AWS::IAM::User
+    Condition: CreateRoles
+    Properties:
+      UserName: !Sub "${AWS::StackName}-${DeviceId}"
+      Policies:
+        - PolicyName: upload-only
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: UploadOwnPrefixOnly
+                Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub "arn:${AWS::Partition}:s3:::${AWS::StackName}-${AWS::AccountId}-data/raw/device=${DeviceId}/*"
+
+Outputs:
+  Bucket:
+    Value: !Ref DataBucket
+  Table:
+    Value: !Ref ReadingsTable
+  ApiUrl:
+    Value: !GetAtt ApiUrl.FunctionUrl
+  AlarmTopic:
+    Value: !Ref AlarmTopic
+  DeviceUser:
+    Condition: CreateRoles
+    Value: !Ref DeviceUser
+    Description: create an access key for this user in the console and put it on the Pi
